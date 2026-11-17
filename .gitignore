@@ -1,0 +1,6 @@
+# Original exam PDFs and OCR working files stay on this computer only
+source/
+
+node_modules/
+.claude/
+*.log
