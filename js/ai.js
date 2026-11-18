@@ -1,7 +1,7 @@
 // All Claude API calls: AI Analysis, Mock Test, and answer-key lookup.
 // The API key lives only in this browser (Settings) and is sent only to Anthropic.
 import Anthropic from "../vendor/anthropic-sdk.js";
-import { questionText } from "./parser.js";
+import { questionText, questionImages } from "./parser.js";
 
 export const MODELS = [
   { id: "claude-opus-5-5", label: "Claude Opus 5.5 (recommended)" },
@@ -47,14 +47,21 @@ function clientFor(settings) {
   return new Anthropic({ apiKey: settings.apiKey, dangerouslyAllowBrowser: true });
 }
 
-async function callJSON(settings, { system, user, schema, effort }) {
+// Charts and tables the questions refer to, sent to Claude as images.
+function imageBlocks(questions) {
+  return questions.flatMap((q) =>
+    questionImages(q).map((img) => ({ type: "image", source: { type: "base64", media_type: img.mediaType, data: img.data } }))
+  );
+}
+
+async function callJSON(settings, { system, user, schema, effort, images = [] }) {
   const client = clientFor(settings);
   const model = settings.model || DEFAULT_MODEL;
   const params = {
     model,
     max_tokens: 16000,
     system,
-    messages: [{ role: "user", content: user }],
+    messages: [{ role: "user", content: images.length ? [...images, { type: "text", text: user }] : user }],
     output_config: { effort, format: { type: "json_schema", schema } },
   };
 
@@ -131,7 +138,7 @@ ${keyLine}
 Explain this question to the student: which knowledge point it tests, the best way to tackle questions of this type, how that approach plays out on this question, and why each choice is right or wrong. The student sees the knowledge point and strategy before the solution, sometimes before they have answered, so keep the answer out of those two parts.
 
 ${languageRule(settings.lang)}`;
-  return callJSON(settings, { system: TUTOR, user, schema: ANALYSIS_SCHEMA, effort: "medium" });
+  return callJSON(settings, { system: TUTOR, user, schema: ANALYSIS_SCHEMA, effort: "medium", images: imageBlocks([question]) });
 }
 
 // ---------- Mock Test ----------
@@ -143,7 +150,7 @@ const MOCK_SCHEMA = {
   properties: {
     topic: { type: "string", description: "The passage's subject in 2-5 words, e.g. 'coral reef bleaching'." },
     skill: { type: "string", description: "Official SAT question type being practised." },
-    passage: { type: "string", description: "The text the student reads. Use ______ for a blank. For student-notes questions, put each note on its own line starting with '• '. Empty string only if the original question has no passage." },
+    passage: { type: "string", description: "The text the student reads. Use ______ for a blank. For student-notes questions, put each note on its own line starting with '• '. If the question needs a table or graph, give its data as a table: a title line, then one row per line in the form | cell | cell |, header row first. Empty string only if the original question has no passage." },
     question: { type: "string", description: "The question stem, worded the way the real SAT words it." },
     options: {
       type: "array",
@@ -178,7 +185,11 @@ Write one new, original practice question that tests the same skill in the same 
 
 Write the passage, question and choices in English, as on the real test. For the explanations: ${languageRule(settings.lang)}`;
 
-  const mock = await callJSON(settings, { system: TUTOR, user, schema: MOCK_SCHEMA, effort: "medium" });
+  const images = imageBlocks([question]);
+  const chartNote = images.length
+    ? "\n\nThe original question relies on the attached chart or table. The app can only show text, so put the new question's data in the passage as a table (rows written as | cell | cell |) and word the question in terms of that table, e.g. 'uses data from the table'."
+    : "";
+  const mock = await callJSON(settings, { system: TUTOR, user: user + chartNote, schema: MOCK_SCHEMA, effort: "medium", images });
   const options = Array.isArray(mock.options) ? mock.options : [];
   if (options.length !== 4 || options.filter((o) => o.correct).length !== 1) {
     throw new AiError("The AI wrote a question without exactly one correct answer. Tap Mock Test to try again.");
@@ -222,7 +233,9 @@ export async function solve(settings, questions) {
 ${body}
 
 For each question give the single best answer. Mark a question as not usable only when scanning damage means no choice can be confidently called correct.`;
-  const out = await callJSON(settings, { system: TUTOR, user, schema: SOLVE_SCHEMA, effort: "high" });
+  const images = imageBlocks(questions);
+  const note = images.length ? "\n\nThe attached images are the figures the questions refer to, in order of appearance." : "";
+  const out = await callJSON(settings, { system: TUTOR, user: user + note, schema: SOLVE_SCHEMA, effort: "high", images });
   const map = new Map();
   for (const r of out.results || []) {
     const q = questions[r.number - 1];

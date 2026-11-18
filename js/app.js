@@ -1,9 +1,11 @@
-import { parseSource, buildBank, renderInline, renderPassage, renderFreeText, escapeHtml as esc } from "./parser.js";
+import { parseSource, buildBank, renderInline, renderPassage, renderFreeText, passageText, escapeHtml as esc } from "./parser.js";
 import * as ai from "./ai.js";
 
-const LS_KEY = "sat-tutor-v1";
+const LS_KEY = "sat-tutor-v2";
+const OLD_LS_KEY = "sat-tutor-v1";
 const QUIZ_SIZE = 10;
 const MAX_MOCKS_KEPT = 10;
+const LIST_PAGE = 50;
 const LETTERS = ["A", "B", "C", "D"];
 
 const app = document.getElementById("app");
@@ -13,9 +15,9 @@ const app = document.getElementById("app");
 function defaults() {
   return {
     settings: { apiKey: "", model: ai.DEFAULT_MODEL, lang: "en" },
-    days: {}, // "YYYY-MM-DD" -> { sets: [{ ids: [...], ans: { id: { pick, key, correct } } }] }
-    seen: {}, // question id -> time last answered
-    aiKeys: {}, // question id -> "A".."D" | "skip", for questions missing from the answer key
+    current: null, // { ids: [...], date: "YYYY-MM-DD" } — the 10 questions on the home screen
+    done: {}, // question id -> { pick, key, correct, at }: every question answered so far
+    aiKeys: {}, // question id -> "A".."D" | "skip", for questions with no answer in the source
     analysis: {}, // "id|lang" -> analysis
     mocks: {}, // question id -> [mock question, ...]
   };
@@ -24,16 +26,21 @@ function defaults() {
 function loadState() {
   const base = defaults();
   try {
-    const saved = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
-    return { ...base, ...saved, settings: { ...base.settings, ...(saved.settings || {}) } };
+    const saved = JSON.parse(localStorage.getItem(LS_KEY) || "null");
+    if (saved) return { ...base, ...saved, settings: { ...base.settings, ...(saved.settings || {}) } };
+    // Version 1 numbered questions differently, so only the settings carry over.
+    const old = JSON.parse(localStorage.getItem(OLD_LS_KEY) || "null");
+    if (old?.settings) base.settings = { ...base.settings, ...old.settings };
   } catch {
-    return base;
+    /* start fresh */
   }
+  return base;
 }
 
 function save() {
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(state));
+    localStorage.removeItem(OLD_LS_KEY);
   } catch (err) {
     console.warn("Could not save progress", err);
   }
@@ -55,16 +62,18 @@ function ui(id) {
 // ---------- dates ----------
 
 const pad = (n) => String(n).padStart(2, "0");
-function todayStr() {
-  const d = new Date();
+function dateStr(d = new Date()) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 function prettyDate(s, opts = { weekday: "long", month: "long", day: "numeric" }) {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString("en-US", opts);
 }
+function shortTime(ts) {
+  return new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
 
-// ---------- question bank and daily sets ----------
+// ---------- question bank and the current set ----------
 
 function answerOf(q) {
   if (q.key) return q.key;
@@ -72,6 +81,7 @@ function answerOf(q) {
   return LETTERS.includes(k) ? k : null;
 }
 const usable = (q) => q.key || state.aiKeys[q.id] !== "skip";
+const isDone = (id) => !!state.done[id];
 
 function shuffle(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
@@ -81,48 +91,50 @@ function shuffle(arr) {
   return arr;
 }
 
-// Random pick that prefers questions not answered yet, then the least recently answered.
-function pickQuestions(n, exclude = new Set()) {
-  const pool = shuffle([...bank.values()].filter(usable));
-  const rank = (q) => (exclude.has(q.id) ? 1e15 : 0) + (state.seen[q.id] || 0);
-  pool.sort((a, b) => rank(a) - rank(b));
-  return shuffle(pool.slice(0, n).map((q) => q.id));
+// Random questions the student has not completed, avoiding `avoid` when there are enough others.
+function pickQuestions(n, avoid = new Set()) {
+  const open = [...bank.values()].filter((q) => usable(q) && !isDone(q.id));
+  const fresh = shuffle(open.filter((q) => !avoid.has(q.id)));
+  const picked = [...fresh, ...shuffle(open.filter((q) => avoid.has(q.id)))].slice(0, n);
+  return picked.map((q) => q.id);
 }
 
-function newSet(exclude) {
-  return { ids: pickQuestions(QUIZ_SIZE, exclude), ans: {} };
-}
-
-function dayOf(date) {
-  if (!state.days[date]) state.days[date] = { sets: [] };
-  return state.days[date];
-}
-
-// Drops questions that are no longer in the source file.
-function cleanDay(day) {
-  for (const set of day.sets) set.ids = set.ids.filter((id) => bank.has(id));
-  day.sets = day.sets.filter((set) => set.ids.length);
-}
-
-function ensureToday() {
-  const day = dayOf(todayStr());
-  cleanDay(day);
-  if (!day.sets.length && bank.size) day.sets.push(newSet());
+function refreshSet() {
+  const avoid = new Set(state.current?.ids || []);
+  state.current = { ids: pickQuestions(QUIZ_SIZE, avoid), date: dateStr() };
+  uiState.clear();
   save();
-  return day;
 }
 
-function setStats(set) {
-  const answered = set.ids.filter((id) => set.ans[id]).length;
-  const correct = set.ids.filter((id) => set.ans[id]?.correct).length;
-  return { total: set.ids.length, answered, correct, complete: answered === set.ids.length };
+// Keeps the current set valid; a new day starts a new set.
+function ensureCurrent() {
+  const cur = state.current;
+  if (cur) cur.ids = cur.ids.filter((id) => bank.has(id));
+  if (!cur || !cur.ids.length || cur.date !== dateStr()) refreshSet();
+  return state.current;
 }
 
-function currentSet() {
-  return state.days[view.date]?.sets[view.setIdx];
+function setStats(ids) {
+  const answered = ids.filter(isDone).length;
+  const correct = ids.filter((id) => state.done[id]?.correct).length;
+  return { total: ids.length, answered, correct, complete: answered === ids.length };
 }
 
-// ---------- answer keys from AI, for questions the key file does not cover ----------
+function openCount() {
+  let n = 0;
+  for (const q of bank.values()) if (usable(q) && !isDone(q.id)) n++;
+  return n;
+}
+
+// Completed questions, newest first, optionally only right or only wrong ones.
+function completedIds(filter = "all") {
+  return Object.entries(state.done)
+    .filter(([id, d]) => bank.has(id) && (filter === "all" || (filter === "wrong" ? !d.correct : d.correct)))
+    .sort((a, b) => b[1].at - a[1].at)
+    .map(([id]) => id);
+}
+
+// ---------- answer keys from AI, for questions the source does not answer ----------
 
 const keyRequests = new Map(); // question id -> in-flight promise
 
@@ -144,14 +156,15 @@ function resolveKeys(ids) {
 }
 
 // Swaps out unanswered questions that the AI flagged as unreadable.
-function replaceUnusable(set) {
+function replaceUnusable() {
+  const ids = state.current.ids;
   let changed = false;
-  set.ids.forEach((id, i) => {
+  ids.forEach((id, i) => {
     const q = bank.get(id);
-    if (q && !usable(q) && !set.ans[id]) {
-      const [fresh] = pickQuestions(1, new Set(set.ids));
-      if (fresh && !set.ids.includes(fresh)) {
-        set.ids[i] = fresh;
+    if (q && !usable(q) && !isDone(id)) {
+      const [fresh] = pickQuestions(1, new Set(ids));
+      if (fresh && !ids.includes(fresh)) {
+        ids[i] = fresh;
         changed = true;
       }
     }
@@ -160,12 +173,14 @@ function replaceUnusable(set) {
   return changed;
 }
 
-function prefetchKeys(set) {
-  resolveKeys(set.ids)
+function prefetchKeys() {
+  const ids = state.current.ids;
+  if (ids.every((id) => bank.get(id)?.key)) return;
+  resolveKeys(ids)
     .then(() => {
-      if (replaceUnusable(set)) {
+      if (replaceUnusable()) {
         render();
-        prefetchKeys(set);
+        prefetchKeys();
       }
     })
     .catch((err) => console.warn("Answer lookup failed", err));
@@ -190,7 +205,16 @@ window.addEventListener("popstate", (e) => {
 // ---------- views ----------
 
 function render() {
-  const views = { loading: loadingView, error: errorView, home: homeView, quiz: quizView, result: resultView, settings: settingsView };
+  const views = {
+    loading: loadingView,
+    error: errorView,
+    home: homeView,
+    quiz: quizView,
+    result: resultView,
+    completed: completedView,
+    review: reviewView,
+    settings: settingsView,
+  };
   app.innerHTML = (views[view.name] || homeView)();
 }
 
@@ -215,47 +239,26 @@ function progressBar(stats) {
   return `<div class="bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><span style="width:${pct}%"></span></div>`;
 }
 
-function setLabel(stats) {
-  if (!stats.answered) return "Start quiz";
-  return stats.complete ? "See results" : "Continue quiz";
-}
-
 function homeView() {
   if (!bank.size) {
     return `${topBar("SAT Tutor", { settings: true })}<main><section class="card"><h2>No questions found</h2><p class="muted">Add questions to <code>resource/sat_source.md</code> and reload.</p></section></main>`;
   }
-  const today = todayStr();
-  const day = ensureToday();
-  const cards = day.sets
-    .map((set, i) => {
-      const s = setStats(set);
-      return `<section class="card ${i === 0 ? "hero" : ""}">
-        ${i === 0 ? `<div class="eyebrow">${esc(prettyDate(today))}</div>` : ""}
-        <h2>${i === 0 ? "Today’s quiz" : `Extra practice ${i}`}</h2>
+  const cur = ensureCurrent();
+  const s = setStats(cur.ids);
+  const doneCount = completedIds().length;
+  const left = openCount();
+  const correctTotal = Object.entries(state.done).filter(([id, d]) => bank.has(id) && d.correct).length;
+
+  const setCard = cur.ids.length
+    ? `<section class="card hero">
+        <div class="eyebrow">${esc(prettyDate(cur.date))}</div>
+        <h2>Your 10 questions</h2>
         <p class="muted">${s.total} questions · Reading and Writing</p>
         ${progressBar(s)}
         <p class="stat-line">${s.answered ? `${s.answered} of ${s.total} answered · ${s.correct} correct` : "Not started yet"}</p>
-        <button class="btn primary block" data-action="open-set" data-date="${today}" data-set="${i}">${setLabel(s)}</button>
-      </section>`;
-    })
-    .join("");
-
-  const allDone = day.sets.every((set) => setStats(set).complete);
-  const extra = allDone ? `<button class="btn block" data-action="extra-set">Practice another ${Math.min(QUIZ_SIZE, bank.size)} questions</button>` : "";
-
-  const past = Object.keys(state.days)
-    .filter((d) => d !== today && state.days[d].sets.some((set) => set.ids.some((id) => bank.has(id))))
-    .sort()
-    .reverse()
-    .slice(0, 30);
-  const history = past.length
-    ? `<section class="card"><h3>Earlier days</h3><ul class="history">${past
-        .map((d) => {
-          const s = setStats(state.days[d].sets[0]);
-          return `<li><button class="row-btn" data-action="open-set" data-date="${d}" data-set="0"><span>${esc(prettyDate(d, { weekday: "short", month: "short", day: "numeric" }))}</span><span class="score-chip">${s.correct}/${s.total}</span></button></li>`;
-        })
-        .join("")}</ul></section>`
-    : "";
+        <button class="btn primary block" data-action="open-set">${!s.answered ? "Start quiz" : s.complete ? "See results" : "Continue quiz"}</button>
+      </section>`
+    : `<section class="card hero"><h2>All done!</h2><p class="muted">You have completed every question in the bank. Review them under Completed.</p></section>`;
 
   const keyHint = state.settings.apiKey
     ? ""
@@ -263,51 +266,42 @@ function homeView() {
 
   return `${topBar("SAT Tutor", { settings: true })}
   <main>
-    ${cards}
-    ${extra}
+    ${setCard}
+    <div class="btn-row">
+      <button class="btn" data-action="refresh" ${left ? "" : "disabled"}>↻ New 10 questions</button>
+      <button class="btn" data-action="completed">✓ Completed (${doneCount})</button>
+    </div>
+    <section class="card stats">
+      <div><b>${doneCount}</b><small>completed</small></div>
+      <div><b>${left}</b><small>to go</small></div>
+      <div><b>${doneCount ? Math.round((correctTotal / doneCount) * 100) + "%" : "–"}</b><small>accuracy</small></div>
+    </section>
     ${keyHint}
-    ${history}
-    <p class="footnote">${bank.size} questions in the bank</p>
   </main>`;
 }
 
-function optionButtons(q, { pick, answer, disabled, action }) {
+function optionButtons(q, { pick, answer, disabled }) {
   return `<div class="options">${LETTERS.map((l) => {
     let cls = "";
     if (answer) {
       if (l === answer.key) cls = "correct";
       else if (l === answer.pick) cls = "wrong";
     } else if (l === pick) cls = "selected";
-    return `<button class="option ${cls}" data-action="${action}" data-letter="${l}" ${disabled ? "disabled" : ""}>
+    return `<button class="option ${cls}" data-action="pick" data-letter="${l}" ${disabled ? "disabled" : ""}>
       <span class="letter">${l}</span><span class="option-text">${renderInline(q.options[l])}</span>
     </button>`;
   }).join("")}</div>`;
 }
 
-function quizView() {
-  const set = currentSet();
-  if (!set || !set.ids.length) return homeView();
-  const idx = Math.min(view.qIdx, set.ids.length - 1);
-  const id = set.ids[idx];
-  const q = bank.get(id);
-  const u = ui(id);
-  const answer = set.ans[id];
-  const stats = setStats(set);
-
-  const pills = set.ids
-    .map((qid, i) => {
-      const a = set.ans[qid];
-      const cls = [i === idx ? "current" : "", a ? (a.correct ? "ok" : "no") : ""].join(" ");
-      return `<button class="pill ${cls}" data-action="goto" data-i="${i}" aria-label="Question ${i + 1}">${i + 1}</button>`;
-    })
-    .join("");
-
+// The question card plus its AI panels; shared by the quiz and the Completed review.
+function questionBody(q) {
+  const u = ui(q.id);
+  const answer = state.done[q.id];
   const feedback = answer
     ? answer.correct
       ? `<div class="feedback ok"><b>Correct!</b></div>`
-      : `<div class="feedback no"><b>Not quite.</b> The correct answer is <b>${answer.key}</b>.</div>`
+      : `<div class="feedback no"><b>Not quite.</b> You chose <b>${answer.pick}</b>; the correct answer is <b>${answer.key}</b>.</div>`
     : "";
-
   const checkError = u.error.check ? `<p class="error-text">${esc(u.error.check)}</p>` : "";
   const actions = answer
     ? `<div class="btn-row">
@@ -316,28 +310,62 @@ function quizView() {
       </div>`
     : `<button class="btn primary block" data-action="check" ${u.pick && !u.busy.check ? "" : "disabled"}>${u.busy.check ? "Checking…" : "Check answer"}</button>
        <button class="btn ai block ${u.showAnalysis ? "active" : ""}" data-action="analysis">✦ AI Analysis</button>`;
-
-  const isLast = idx === set.ids.length - 1;
-  return `${topBar(`Question ${idx + 1} of ${set.ids.length}`, { back: true })}
-  <main class="quiz">
-    <nav class="pills" aria-label="Questions">${pills}</nav>
-    <article class="card question">
-      <span class="tag">${esc(q.category)}</span>
+  return `<article class="card question">
+      <div class="q-meta"><span class="tag">${esc(q.category)}</span><span class="source">${esc(q.doc)} · #${q.page}</span></div>
       ${q.passage.length ? `<div class="passage">${renderPassage(q.passage)}</div>` : ""}
       <p class="stem">${renderInline(q.stem)}</p>
-      ${optionButtons(q, { pick: u.pick, answer, disabled: !!answer || u.busy.check, action: "pick" })}
+      ${optionButtons(q, { pick: u.pick, answer, disabled: !!answer || u.busy.check })}
       ${feedback}
       ${checkError}
       ${actions}
     </article>
     ${u.showAnalysis ? analysisPanel(q, u, !!answer) : ""}
-    ${u.showMock ? mockPanel(q, u) : mockLink(q)}
+    ${u.showMock ? mockPanel(q, u) : mockLink(q)}`;
+}
+
+function quizView() {
+  const ids = state.current?.ids || [];
+  if (!ids.length) return homeView();
+  const idx = Math.min(view.qIdx, ids.length - 1);
+  const q = bank.get(ids[idx]);
+  const stats = setStats(ids);
+
+  const pills = ids
+    .map((qid, i) => {
+      const a = state.done[qid];
+      const cls = [i === idx ? "current" : "", a ? (a.correct ? "ok" : "no") : ""].join(" ");
+      return `<button class="pill ${cls}" data-action="goto" data-i="${i}" aria-label="Question ${i + 1}">${i + 1}</button>`;
+    })
+    .join("");
+
+  const isLast = idx === ids.length - 1;
+  return `${topBar(`Question ${idx + 1} of ${ids.length}`, { back: true })}
+  <main class="quiz">
+    <nav class="pills" aria-label="Questions">${pills}</nav>
+    ${questionBody(q)}
   </main>
   <footer class="navbar">
     <button class="btn" data-action="goto" data-i="${idx - 1}" ${idx === 0 ? "disabled" : ""}>‹ Previous</button>
     ${isLast
       ? `<button class="btn primary" data-action="finish">${stats.complete ? "See results" : "Finish"}</button>`
       : `<button class="btn primary" data-action="goto" data-i="${idx + 1}">Next ›</button>`}
+  </footer>`;
+}
+
+function reviewView() {
+  const list = completedIds(view.filter);
+  const idx = list.indexOf(view.id);
+  const q = bank.get(view.id);
+  if (!q) return completedView();
+  const done = state.done[q.id];
+  return `${topBar(idx >= 0 ? `Completed ${idx + 1} of ${list.length}` : "Completed", { back: true })}
+  <main class="quiz">
+    <p class="muted small">Answered ${esc(shortTime(done?.at || Date.now()))}</p>
+    ${questionBody(q)}
+  </main>
+  <footer class="navbar">
+    <button class="btn" data-action="review-nav" data-id="${esc(list[idx - 1] || "")}" ${idx > 0 ? "" : "disabled"}>‹ Newer</button>
+    <button class="btn" data-action="review-nav" data-id="${esc(list[idx + 1] || "")}" ${idx >= 0 && idx < list.length - 1 ? "" : "disabled"}>Older ›</button>
   </footer>`;
 }
 
@@ -427,9 +455,9 @@ function mockPanel(q, u) {
 }
 
 function resultView() {
-  const set = currentSet();
-  if (!set) return homeView();
-  const s = setStats(set);
+  const ids = state.current?.ids || [];
+  if (!ids.length) return homeView();
+  const s = setStats(ids);
   const pct = s.total ? s.correct / s.total : 0;
   const message = !s.complete
     ? `${s.total - s.answered} question${s.total - s.answered === 1 ? "" : "s"} left to answer.`
@@ -440,24 +468,59 @@ function resultView() {
         : pct >= 0.5
           ? "Good effort. Use AI Analysis on the ones you missed."
           : "Keep going. Read the AI Analysis for each missed question, then try a Mock Test.";
-  const rows = set.ids
+  const rows = ids
     .map((id, i) => {
       const q = bank.get(id);
-      const a = set.ans[id];
+      const a = state.done[id];
       const mark = a ? (a.correct ? `<span class="mark ok">✓</span>` : `<span class="mark no">✗</span>`) : `<span class="mark">–</span>`;
-      return `<li><button class="row-btn" data-action="review" data-i="${i}">${mark}<span class="row-main"><b>Question ${i + 1}</b><small>${esc(q.category)}</small></span><span class="chev">›</span></button></li>`;
+      return `<li><button class="row-btn" data-action="goto-quiz" data-i="${i}">${mark}<span class="row-main"><b>Question ${i + 1}</b><small>${esc(q.category)}</small></span><span class="chev">›</span></button></li>`;
     })
     .join("");
-  const isToday = view.date === todayStr();
-  return `${topBar(isToday ? "Results" : prettyDate(view.date, { month: "short", day: "numeric" }), { back: true })}
+  return `${topBar("Results", { back: true })}
   <main>
     <section class="card score-card">
       <div class="score"><span>${s.correct}</span><small>/ ${s.total}</small></div>
       <p>${message}</p>
     </section>
     <section class="card"><ul class="history">${rows}</ul></section>
-    ${isToday && s.complete ? `<button class="btn block" data-action="extra-set">Practice another ${Math.min(QUIZ_SIZE, bank.size)} questions</button>` : ""}
-    <button class="btn primary block" data-action="home">Back to home</button>
+    ${openCount() ? `<button class="btn primary block" data-action="refresh">↻ New 10 questions</button>` : ""}
+    <button class="btn block" data-action="home">Back to home</button>
+  </main>`;
+}
+
+function snippet(q) {
+  const text = (passageText(q.passage) || q.stem).replace(/\*\*/g, "").replace(/`?_{3,}`?/g, "____");
+  return text.length > 110 ? text.slice(0, 110).trimEnd() + "…" : text;
+}
+
+function completedView() {
+  const filter = view.filter || "all";
+  const all = completedIds();
+  const list = completedIds(filter);
+  const wrong = all.filter((id) => !state.done[id].correct).length;
+  const limit = view.limit || LIST_PAGE;
+  const tab = (key, label) =>
+    `<button class="seg ${filter === key ? "on" : ""}" data-action="filter" data-filter="${key}">${label}</button>`;
+  const rows = list
+    .slice(0, limit)
+    .map((id) => {
+      const q = bank.get(id);
+      const d = state.done[id];
+      return `<li><button class="row-btn" data-action="review" data-id="${esc(id)}">
+        <span class="mark ${d.correct ? "ok" : "no"}">${d.correct ? "✓" : "✗"}</span>
+        <span class="row-main"><b>${esc(q.category)}</b><small>${esc(snippet(q))}</small></span>
+        <span class="row-date">${esc(shortTime(d.at))}</span>
+      </button></li>`;
+    })
+    .join("");
+  const empty = !list.length
+    ? `<p class="muted center-text">${all.length ? "Nothing here yet." : "Questions you answer will be saved here."}</p>`
+    : "";
+  return `${topBar("Completed", { back: true })}
+  <main>
+    <div class="segmented">${tab("all", `All (${all.length})`)}${tab("wrong", `Wrong (${wrong})`)}${tab("correct", `Correct (${all.length - wrong})`)}</div>
+    ${list.length ? `<section class="card"><ul class="history">${rows}</ul></section>` : empty}
+    ${list.length > limit ? `<button class="btn block" data-action="more">Show more (${list.length - limit} left)</button>` : ""}
   </main>`;
 }
 
@@ -488,7 +551,7 @@ function settingsView() {
     </section>
     <section class="card form">
       <h3>Progress</h3>
-      <p class="muted small">${bank.size} questions in the bank · ${Object.keys(state.seen).length} answered so far · ${Object.keys(state.analysis).length} analyses saved</p>
+      <p class="muted small">${bank.size} questions in the bank · ${completedIds().length} completed · ${Object.keys(state.analysis).length} analyses saved</p>
       <button class="btn danger" data-action="reset">Reset all progress</button>
     </section>
   </main>`;
@@ -501,6 +564,13 @@ function readSettingsForm() {
   state.settings.model = document.getElementById("model").value;
   state.settings.lang = document.getElementById("lang").value;
   save();
+}
+
+// The question shown on the quiz or review screen.
+function activeQuestion() {
+  if (view.name === "review") return bank.get(view.id);
+  const ids = state.current?.ids || [];
+  return bank.get(ids[Math.min(view.qIdx ?? 0, ids.length - 1)]);
 }
 
 async function runAnalysis(q, u) {
@@ -540,8 +610,8 @@ async function runMock(q, u) {
   render();
 }
 
-async function checkAnswer(set, q, u) {
-  if (!u.pick || u.busy.check) return;
+async function checkAnswer(q, u) {
+  if (!u.pick || u.busy.check || isDone(q.id)) return;
   u.error.check = null;
   if (!answerOf(q)) {
     if (!state.settings.apiKey) {
@@ -557,7 +627,7 @@ async function checkAnswer(set, q, u) {
     }
     u.busy.check = false;
     if (!usable(q)) {
-      replaceUnusable(set);
+      replaceUnusable();
       return render();
     }
     if (!answerOf(q)) {
@@ -566,64 +636,80 @@ async function checkAnswer(set, q, u) {
     }
   }
   const key = answerOf(q);
-  set.ans[q.id] = { pick: u.pick, key, correct: u.pick === key };
-  state.seen[q.id] = Date.now();
+  state.done[q.id] = { pick: u.pick, key, correct: u.pick === key, at: Date.now() };
   save();
   render();
 }
 
-function openSet(date, setIdx) {
-  const set = state.days[date]?.sets[setIdx];
-  if (!set) return;
-  const s = setStats(set);
-  if (s.complete) return go({ name: "result", date, setIdx });
-  const firstOpen = set.ids.findIndex((id) => !set.ans[id]);
-  prefetchKeys(set);
-  go({ name: "quiz", date, setIdx, qIdx: Math.max(firstOpen, 0) });
+function openSet() {
+  const ids = ensureCurrent().ids;
+  if (setStats(ids).complete) return go({ name: "result" });
+  prefetchKeys();
+  go({ name: "quiz", qIdx: Math.max(ids.findIndex((id) => !isDone(id)), 0) });
 }
 
 const actions = {
   reload: () => location.reload(),
+
+  // Full-size chart view; the viewer pinch-zooms and scrolls it like any page.
+  zoom(d, el) {
+    const src = el.querySelector("img")?.src;
+    if (!src) return;
+    const box = document.createElement("div");
+    box.className = "zoom";
+    box.innerHTML = `<button class="icon-btn zoom-close" aria-label="Close">✕</button><div class="zoom-scroll"><img alt="Enlarged chart"></div>`;
+    box.querySelector("img").src = src;
+    box.addEventListener("click", (e) => {
+      if (e.target.closest(".zoom-close") || !e.target.closest("img")) box.remove();
+    });
+    document.body.appendChild(box);
+  },
   back: () => history.back(),
   home: () => go({ name: "home" }),
   settings: () => go({ name: "settings" }),
 
-  "open-set": (d) => openSet(d.date, Number(d.set)),
+  "open-set": openSet,
 
-  "extra-set"() {
-    const day = ensureToday();
-    const used = new Set(day.sets.flatMap((set) => set.ids));
-    day.sets.push(newSet(used));
-    save();
-    openSet(todayStr(), day.sets.length - 1);
+  refresh() {
+    refreshSet();
+    if (view.name === "home") render();
+    else go({ name: "home" }, { replace: true });
+  },
+
+  completed: () => go({ name: "completed", filter: "all" }),
+  filter: (d) => go({ name: "completed", filter: d.filter }, { replace: true }),
+  more() {
+    view.limit = (view.limit || LIST_PAGE) + LIST_PAGE;
+    history.replaceState(view, "");
+    render();
+  },
+  review: (d) => go({ name: "review", id: d.id, filter: view.filter || "all" }),
+  "review-nav"(d) {
+    if (d.id) go({ ...view, id: d.id }, { replace: true });
   },
 
   goto(d) {
-    const set = currentSet();
     const i = Number(d.i);
-    if (!set || i < 0 || i >= set.ids.length) return;
-    go({ ...view, qIdx: i }, { replace: true });
+    if (i < 0 || i >= (state.current?.ids.length || 0)) return;
+    go({ name: "quiz", qIdx: i }, { replace: true });
   },
-
-  review: (d) => go({ name: "quiz", date: view.date, setIdx: view.setIdx, qIdx: Number(d.i) }),
-  finish: () => go({ name: "result", date: view.date, setIdx: view.setIdx }),
+  "goto-quiz": (d) => go({ name: "quiz", qIdx: Number(d.i) }),
+  finish: () => go({ name: "result" }),
 
   pick(d) {
-    const set = currentSet();
-    const id = set.ids[view.qIdx];
-    if (set.ans[id]) return;
-    ui(id).pick = d.letter;
+    const q = activeQuestion();
+    if (!q || isDone(q.id)) return;
+    ui(q.id).pick = d.letter;
     render();
   },
 
   check() {
-    const set = currentSet();
-    const q = bank.get(set.ids[view.qIdx]);
-    checkAnswer(set, q, ui(q.id));
+    const q = activeQuestion();
+    if (q) checkAnswer(q, ui(q.id));
   },
 
   analysis() {
-    const q = bank.get(currentSet().ids[view.qIdx]);
+    const q = activeQuestion();
     const u = ui(q.id);
     u.showAnalysis = !u.showAnalysis || !!u.error.analysis;
     render();
@@ -631,22 +717,22 @@ const actions = {
   },
 
   "retry-analysis"() {
-    const q = bank.get(currentSet().ids[view.qIdx]);
+    const q = activeQuestion();
     runAnalysis(q, ui(q.id));
   },
 
   reveal() {
-    ui(currentSet().ids[view.qIdx]).reveal = true;
+    ui(activeQuestion().id).reveal = true;
     render();
   },
 
   mock() {
-    const q = bank.get(currentSet().ids[view.qIdx]);
+    const q = activeQuestion();
     runMock(q, ui(q.id));
   },
 
   "show-mocks"() {
-    const q = bank.get(currentSet().ids[view.qIdx]);
+    const q = activeQuestion();
     const u = ui(q.id);
     u.showMock = true;
     u.mockIdx = (state.mocks[q.id] || []).length - 1;
@@ -654,19 +740,19 @@ const actions = {
   },
 
   "mock-nav"(d) {
-    const u = ui(currentSet().ids[view.qIdx]);
+    const u = ui(activeQuestion().id);
     u.mockIdx = Number(d.i);
     u.mockPick = null;
     render();
   },
 
   "mock-pick"(d) {
-    ui(currentSet().ids[view.qIdx]).mockPick = Number(d.i);
+    ui(activeQuestion().id).mockPick = Number(d.i);
     render();
   },
 
   "mock-check"() {
-    const id = currentSet().ids[view.qIdx];
+    const id = activeQuestion().id;
     const u = ui(id);
     const mock = (state.mocks[id] || [])[u.mockIdx];
     if (!mock || u.mockPick === null) return;
@@ -698,7 +784,7 @@ const actions = {
   },
 
   reset() {
-    if (!confirm("Erase all quiz history, saved analyses and mock questions on this device? Your API key and settings are kept.")) return;
+    if (!confirm("Erase all completed questions, saved analyses and mock questions on this device? Your API key and settings are kept.")) return;
     state = { ...defaults(), settings: state.settings };
     uiState.clear();
     save();
@@ -710,7 +796,7 @@ const actions = {
 app.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
   if (!el || el.disabled) return;
-  actions[el.dataset.action]?.(el.dataset);
+  actions[el.dataset.action]?.(el.dataset, el);
 });
 
 // ---------- start ----------

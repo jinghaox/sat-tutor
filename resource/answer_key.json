@@ -1,20 +1,3 @@
 {
-  "_readme": "Answer key: exam name (the '## N. name.pdf' heading without '.pdf') -> page number -> A/B/C/D, or \"skip\" to leave a broken question out. Questions with no entry are solved by AI the first time they appear.",
-  "12月7日北美A卷": {
-    "1": "A",
-    "2": "C",
-    "3": "C",
-    "4": "B",
-    "5": "skip",
-    "6": "D",
-    "7": "B",
-    "8": "C",
-    "9": "skip",
-    "10": "C",
-    "11": "C",
-    "12": "A",
-    "13": "C",
-    "14": "D",
-    "15": "A"
-  }
+  "_readme": "Optional corrections. Answers normally come from the **答案：X** line under each question in sat_source.md. To override one, add: exam name (the '## N. name.pdf' heading without '.pdf') -> question number -> A/B/C/D, or \"skip\" to leave a broken question out."
 }

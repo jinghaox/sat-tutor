@@ -6,7 +6,9 @@
 //   <passage paragraphs>
 //   <question stem>
 //   A. ...  B. ...  C. ...  D. ...
+//   **答案：B**               <- optional answer line
 //   ---
+// Chart questions embed the chart as ![alt](data:image/...;base64,...) on its own line.
 
 const UNESCAPE = /\\([\\`*_{}\[\]()#+\-.!|>~])/g;
 const LETTERS = ["A", "B", "C", "D"];
@@ -44,8 +46,10 @@ export function parseSource(md) {
       flush();
     } else if (/^-{3,}$/.test(line)) {
       flush();
-    } else if (/^\[[^\]]*\]\([^)]*\)$/.test(line)) {
-      // "[查看原页](file.pdf#page=N)" link back to the PDF: not part of the question
+    } else if (/^(?:\[[^\]]*\]\([^)\s]*\)[\s·,，、]*)+$/.test(line)) {
+      // "[原 PDF 第 N 页](file.pdf#page=N)" link back to the PDF: not part of the question
+    } else if (/^>/.test(line)) {
+      // editor's notes (blockquotes) are not part of the question
     } else {
       if (!cur) start(null);
       cur.lines.push(line);
@@ -67,7 +71,25 @@ function toQuestion(block) {
   const pre = [];
   const options = {};
   let current = null;
+  let answer = null;
   for (const line of block.lines) {
+    const ans = line.match(/^\**\s*答案\s*[：:]\s*\**\s*([A-D])\b/);
+    if (ans) {
+      answer = ans[1];
+      current = null;
+      continue;
+    }
+    if (answer) continue; // anything after the answer line is commentary
+    const img = line.match(/^(.*?)\s*!\[([^\]]*)\]\((data:image\/[a-z+]+;base64,[A-Za-z0-9+/=\s]+)\)\s*(.*)$/);
+    if (img) {
+      if (!current) {
+        // Text glued to the image is usually a scanned page header ("Module 1: Reading and Writing").
+        if (img[1] && !/reading and writing/i.test(img[1])) pre.push(img[1]);
+        pre.push({ img: img[3].replace(/\s+/g, ""), alt: img[2] });
+        if (img[4]) pre.push(img[4]);
+      }
+      continue;
+    }
     const expected = LETTERS[Object.keys(options).length];
     const m = line.match(/^([A-D])[.)](?:\s+(.*))?$/);
     if (m && m[1] === expected) {
@@ -79,9 +101,20 @@ function toQuestion(block) {
       pre.push(line);
     }
   }
-  if (LETTERS.some((l) => !options[l]) || pre.length === 0) return null;
+  if (LETTERS.some((l) => !options[l])) return null;
+  const texts = pre.filter((p) => typeof p === "string");
+  if (!texts.length || typeof pre[pre.length - 1] !== "string") return null;
 
-  const stem = pre.pop();
+  // The stem is the last text line, but scans often wrap it over two lines.
+  let stem = pre.pop();
+  const STEM_START = /^(Which|What|How|Why|As used|Based on|According to|The (student|text|author|passage|graph|table)|In the)/;
+  while (
+    typeof pre[pre.length - 1] === "string" &&
+    !/[.?!:"”’)\]`_]$/.test(pre[pre.length - 1]) &&
+    (/^[a-z]/.test(stem) || STEM_START.test(pre[pre.length - 1]))
+  ) {
+    stem = pre.pop() + " " + stem;
+  }
   const passage = buildPassage(pre);
   const doc = block.doc || "Questions";
   return {
@@ -91,7 +124,8 @@ function toQuestion(block) {
     passage,
     stem,
     options,
-    category: categorize(stem, pre.join(" ")),
+    category: categorize(stem, texts.join(" ")),
+    answer,
   };
 }
 
@@ -101,6 +135,10 @@ function buildPassage(paragraphs) {
   const out = [];
   let inNotes = false;
   for (const text of paragraphs) {
+    if (typeof text !== "string") {
+      out.push({ type: "img", src: text.img, alt: text.alt });
+      continue;
+    }
     if (inNotes) {
       const items = splitSentences(text);
       const last = out[out.length - 1];
@@ -137,7 +175,7 @@ export function categorize(stem, passage = "") {
   if (s.includes("conventions of standard english")) return "Standard English Conventions";
   if (s.includes("logical transition")) return "Transitions";
   if (s.includes("from the notes") || s.includes("from the given sentences")) return "Rhetorical Synthesis";
-  if (s.includes("most logically completes")) return "Inferences";
+  if (/most lo\w*ically completes/.test(s)) return "Inferences";
   if (/main (idea|purpose)|overall structure|function of/.test(s)) return /main idea/.test(s) ? "Central Ideas and Details" : "Text Structure and Purpose";
   if (/support|weaken|undermine|data from|graph|table|illustrate/.test(s)) return "Command of Evidence";
   if (/according to the text|based on the text|best states/.test(s)) return "Central Ideas and Details";
@@ -146,10 +184,11 @@ export function categorize(stem, passage = "") {
 
 // Letters and digits only: used to spot the same question scanned twice.
 export function fingerprint(q) {
-  return (passageText(q.passage) + q.stem).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const imgs = q.passage.filter((b) => b.type === "img").map((b) => b.src.length).join(",");
+  return (passageText(q.passage) + q.stem).toLowerCase().replace(/[^a-z0-9]/g, "") + imgs;
 }
 
-/** Applies the answer key and drops skipped / duplicate questions. */
+/** Applies the answer key (it overrides answers in the source) and drops skipped / duplicate questions. */
 export function buildBank(questions, answerKey = {}) {
   const bank = [];
   const seen = new Set();
@@ -167,24 +206,40 @@ export function buildBank(questions, answerKey = {}) {
       continue;
     }
     seen.add(fp);
-    bank.push({ ...q, key: LETTERS.includes(key) ? key : null });
+    bank.push({ ...q, key: LETTERS.includes(key) ? key : q.answer || null });
   }
   return { bank, dropped };
 }
 
 // ---------- text helpers shared by the UI and the AI prompts ----------
 
-export function passageText(passage) {
+export function passageText(passage, { figures = false } = {}) {
+  let n = 0;
   return passage
-    .map((b) => (b.type === "ul" ? b.items.map((i) => "• " + i).join("\n") : b.text))
+    .map((b) => {
+      if (b.type === "img") return figures ? `[Figure ${++n}: shown in the attached image]` : "";
+      return b.type === "ul" ? b.items.map((i) => "• " + i).join("\n") : b.text;
+    })
+    .filter(Boolean)
     .join("\n\n");
+}
+
+/** The question's images as { mediaType, data } for the AI, in order. */
+export function questionImages(q) {
+  return q.passage
+    .filter((b) => b.type === "img")
+    .map((b) => {
+      const m = b.src.match(/^data:(image\/[a-z+]+);base64,(.*)$/);
+      return m ? { mediaType: m[1], data: m[2] } : null;
+    })
+    .filter(Boolean);
 }
 
 /** Plain-text version of a question for an AI prompt. */
 export function questionText(q) {
   const clean = (t) => t.replace(/`?_{3,}`?/g, "______");
   const parts = [];
-  if (q.passage.length) parts.push(clean(passageText(q.passage)));
+  if (q.passage.length) parts.push(clean(passageText(q.passage, { figures: true })));
   parts.push("Question: " + clean(q.stem));
   parts.push(LETTERS.map((l) => `${l}. ${clean(q.options[l])}`).join("\n"));
   return parts.join("\n\n");
@@ -201,14 +256,25 @@ export function renderInline(text) {
     .replace(/\*\*(.+?)\*\*/g, "<u>$1</u>");
 }
 
-/** Renders a parsed passage (array of paragraph / bullet-list blocks). */
+/** Renders a parsed passage (paragraph / bullet-list / image / table blocks). */
 export function renderPassage(passage) {
   return passage
-    .map((b) =>
-      b.type === "ul"
-        ? `<ul>${b.items.map((i) => `<li>${renderInline(i)}</li>`).join("")}</ul>`
-        : `<p>${renderInline(b.text)}</p>`
-    )
+    .map((b) => {
+      if (b.type === "ul") return `<ul>${b.items.map((i) => `<li>${renderInline(i)}</li>`).join("")}</ul>`;
+      if (b.type === "img") {
+        return /^data:image\/[a-z+]+;base64,[A-Za-z0-9+/=]+$/.test(b.src)
+          ? `<figure class="figure"><button class="figure-btn" data-action="zoom" aria-label="Enlarge chart"><img src="${b.src}" alt="${escapeHtml(b.alt || "Chart for this question")}"></button><figcaption>Tap the chart to enlarge</figcaption></figure>`
+          : "";
+      }
+      if (b.type === "table") {
+        const [head, ...body] = b.rows;
+        const cells = (row, tag) => row.map((c) => `<${tag}>${renderInline(c)}</${tag}>`).join("");
+        return `<div class="table-wrap"><table><thead><tr>${cells(head, "th")}</tr></thead><tbody>${body
+          .map((r) => `<tr>${cells(r, "td")}</tr>`)
+          .join("")}</tbody></table></div>`;
+      }
+      return `<p>${renderInline(b.text)}</p>`;
+    })
     .join("");
 }
 
@@ -218,8 +284,16 @@ export function renderFreeText(text) {
   for (const raw of String(text).split(/\n+/)) {
     const line = raw.trim();
     if (!line) continue;
-    const m = line.match(/^(?:[•\-*–]|\d+[.)])\s+(.*)$/);
     const last = blocks[blocks.length - 1];
+    if (/^\|.*\|$/.test(line)) {
+      // markdown-style table row; the |---|---| separator row is skipped
+      if (/^\|[\s:|-]+\|$/.test(line)) continue;
+      const row = line.slice(1, -1).split("|").map((c) => c.trim());
+      if (last && last.type === "table") last.rows.push(row);
+      else blocks.push({ type: "table", rows: [row] });
+      continue;
+    }
+    const m = line.match(/^(?:[•\-*–]|\d+[.)])\s+(.*)$/);
     if (m) {
       if (last && last.type === "ul") last.items.push(m[1]);
       else blocks.push({ type: "ul", items: [m[1]] });

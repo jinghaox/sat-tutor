@@ -1,6 +1,6 @@
 // Offline support: always try the network first so new questions and app
 // updates show up immediately, and fall back to the last saved copy offline.
-const CACHE = "sat-tutor-v1";
+const CACHE = "sat-tutor-v2";
 
 self.addEventListener("install", () => self.skipWaiting());
 
